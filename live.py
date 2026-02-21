@@ -55,6 +55,7 @@ def get_layout(args):
         "required_total_bytes": required_total_bytes,
     }
 
+
 def get_partition_nodes(disk):
     """
     Finds the actual device nodes for the first and second partitions.
@@ -63,10 +64,7 @@ def get_partition_nodes(disk):
     # Use lsblk to list children of the disk, sorted by name
     # We strip the path to get names like 'sdb1' or 'mmcblk0p1'
     try:
-        out = subprocess.check_output(
-            ["lsblk", "-ln", "-o", "NAME", disk],
-            text=True
-        ).splitlines()
+        out = subprocess.check_output(["lsblk", "-ln", "-o", "NAME", disk], text=True).splitlines()
 
         # The first entry is the disk itself, the rest are partitions
         partitions = [f"/dev/{p.strip()}" for p in out if f"/dev/{p.strip()}" != disk]
@@ -74,34 +72,33 @@ def get_partition_nodes(disk):
         if len(partitions) < 2:
             raise RuntimeError(f"Could not find at least 2 partitions on {disk}")
 
-        return partitions[0], partitions[1] # Returns (boot, root)
+        return partitions[0], partitions[1]  # Returns (boot, root)
     except Exception as e:
         print(f"Error resolving partitions for {disk}: {e}")
         return None, None
+
 
 def clone_target(target, layout):
     disk = f"/dev/{target}"
     print(f"--- Processing {disk} ---")
     try:
-        # Unmount
-        subprocess.run(f"mount | grep '^{disk}' | cut -d' ' -f1 | xargs -r umount", shell=True)
-
         # Size check
         tgt_bytes = int(run_cmd(["blockdev", "--getsize64", disk], capture=True))
         if tgt_bytes < layout["required_total_bytes"]:
             print(f"Skipping {disk} - too small")
             return
 
-        print(f"Rebuilding {disk}...")
+        # 1. Prepare Target
+        subprocess.run(f"mount | grep '^{disk}' | cut -d' ' -f1 | xargs -r umount", shell=True)
         run_cmd(["wipefs", "-a", disk])
 
+        # 2. Rebuild Partition Table
         sfdisk_input = (
             f"label: dos\nunit: sectors\n"
             f"{disk}1 : start={layout['boot_start']}, size={layout['boot_size_sectors']}, type=c\n"
             f"{disk}2 : start={layout['root_start']}, type=83\n"
         )
         subprocess.run(["sfdisk", disk], input=sfdisk_input, text=True, check=True)
-
         run_cmd(["udevadm", "settle"])
         run_cmd(["partprobe", disk])
         time.sleep(2)
@@ -110,15 +107,22 @@ def clone_target(target, layout):
         if not p1 or not os.path.exists(p1):
             print(f"FAILED: Device node {p1} not found")
             return
+        # 3. Stream Boot Partition
+        print(f"Streaming boot partition to {p1}...")
+        run_cmd(["dd", f"if={layout['boot_dev']}", f"of={p1}", "bs=4M", "conv=fsync"])
 
-        print(f"Copying partitions to {disk}...")
-        run_cmd(["dd", f"if={layout['boot_dev']}", f"of={p1}", "bs=4M", "conv=sparse,fsync"])
-        run_cmd(["e2image", "-ra", layout['root_dev'], p2])
+        # 4. Stream Root Partition via Partclone
+        # -b: batch mode, -s: source, -o: output
+        print(f"Streaming root partition (used blocks only) to {p2}...")
+        run_cmd(["partclone.ext4", "-s", layout['root_dev'], "-o", p2, "-b", "-L", "/tmp/partclone.log"])
+
+        # 5. The "Magic" Fix-up
+        # Partclone copies the filesystem exactly, so the superblock still thinks it's 60GB.
+        # We must resize the filesystem to match the NEW (smaller) partition size immediately.
+        print("Adjusting filesystem to fit new partition...")
         run_cmd(["e2fsck", "-y", "-f", p2])
 
-        print(f"Expanding {disk}...")
-        subprocess.run(["sfdisk", "-N2", disk], input=", +", text=True, check=True)
-        run_cmd(["udevadm", "settle"])
+        # This forces the filesystem to shrink/expand to the physical partition size
         run_cmd(["resize2fs", p2])
 
         print(f"Finished {disk}")

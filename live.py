@@ -3,6 +3,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 
@@ -112,19 +113,18 @@ def clone_target(target, layout):
         run_cmd(["dd", f"if={layout['boot_dev']}", f"of={p1}", "bs=4M", "conv=fsync"])
 
         # 4. Stream Root Partition via Partclone
-        # -b: batch mode, -s: source, -o: output
-        print(f"Streaming root partition (used blocks only) to {p2}...")
-        run_cmd(["partclone.ext4", "-s", layout['root_dev'], "-o", p2, "-b", "-L", "/tmp/partclone.log"])
+        with tempfile.NamedTemporaryFile(prefix=f"partclone_{target}_", suffix=".log", delete=False) as tmp_log:
+            log_path = tmp_log.name
+        print(f"[{target}] Streaming root partition (used blocks only) to {p2}...")
+        pipe_cmd = f"fsarchiver savefs - - {layout['root_dev']} | fsarchiver restfs - id=0,dest={p2}"
+        subprocess.run(pipe_cmd, shell=True, check=True)
 
-        # 5. The "Magic" Fix-up
-        # Partclone copies the filesystem exactly, so the superblock still thinks it's 60GB.
-        # We must resize the filesystem to match the NEW (smaller) partition size immediately.
         print("Adjusting filesystem to fit new partition...")
         run_cmd(["e2fsck", "-y", "-f", p2])
-
-        # This forces the filesystem to shrink/expand to the physical partition size
         run_cmd(["resize2fs", p2])
 
+        run_cmd(["blockdev", "--flushbufs", disk])
+        os.remove(log_path)
         print(f"Finished {disk}")
     except Exception as e:
         print(f"FAILED {disk}: {e}")

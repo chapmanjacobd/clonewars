@@ -6,16 +6,22 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
 
+
 def run_cmd(cmd, shell=False, capture=False):
     res = subprocess.run(cmd, shell=shell, check=True, text=True, capture_output=capture)
     return res.stdout.strip() if capture else res
 
+
 def get_layout(args):
     boot_part = run_cmd(
-        f"lsblk -ln -o NAME,FSTYPE {args.source} | awk '$2==\"vfat\"{{print $1}}'", shell=True, capture=True
+        f"lsblk -ln -o NAME,FSTYPE {args.source} | awk '$2==\"vfat\"{{print $1}}'",
+        shell=True,
+        capture=True,
     )
     root_part = run_cmd(
-        f"lsblk -ln -o NAME,FSTYPE {args.source} | awk '$2 ~ /^ext/{{print $1}}'", shell=True, capture=True
+        f"lsblk -ln -o NAME,FSTYPE {args.source} | awk '$2 ~ /^ext/{{print $1}}'",
+        shell=True,
+        capture=True,
     )
 
     if not boot_part or not root_part:
@@ -32,8 +38,20 @@ def get_layout(args):
     boot_size = int(run_cmd(["lsblk", "-b", "-no", "SIZE", boot_dev], capture=True))
     root_start = int(run_cmd(["lsblk", "-b", "-no", "START", root_dev], capture=True))
 
-    block_size = int(run_cmd(f"dumpe2fs -h {root_dev} 2>/dev/null | awk -F: '/Block size/ {{gsub(/ /,\"\"); print $2}}'", shell=True, capture=True))
-    min_blocks = int(run_cmd(f"resize2fs -P {root_dev} 2>/dev/null | awk '{{print $NF}}'", shell=True, capture=True))
+    block_size = int(
+        run_cmd(
+            f"dumpe2fs -h {root_dev} 2>/dev/null | awk -F: '/Block size/ {{gsub(/ /,\"\"); print $2}}'",
+            shell=True,
+            capture=True,
+        )
+    )
+    min_blocks = int(
+        run_cmd(
+            f"resize2fs -P {root_dev} 2>/dev/null | awk '{{print $NF}}'",
+            shell=True,
+            capture=True,
+        )
+    )
 
     min_fs_bytes = min_blocks * block_size
     required_total_bytes = (root_start * 512) + min_fs_bytes
@@ -48,6 +66,7 @@ def get_layout(args):
         "required_total_bytes": required_total_bytes,
     }
 
+
 def get_partition_nodes(disk):
     try:
         out = subprocess.check_output(["lsblk", "-ln", "-o", "NAME", disk], text=True).splitlines()
@@ -59,7 +78,8 @@ def get_partition_nodes(disk):
         print(f"Error resolving partitions for {disk}: {e}")
         return None, None
 
-def clone_target(target, layout, src_mnt):
+
+def clone_target(target, layout, src_mnt, fpsync_workers=None):
     disk = f"/dev/{target}"
     dst_mnt = f"/tmp/dst_{target}"
     print(f"--- Processing {disk} ---")
@@ -99,11 +119,13 @@ def clone_target(target, layout, src_mnt):
         os.makedirs(dst_mnt, exist_ok=True)
         try:
             run_cmd(["mount", p2, dst_mnt])
-            # -aHAX preserves almost all metadata, --numeric-ids is critical for rootfs
-            run_cmd([
-                "rsync", "-aHAX", "--numeric-ids", "--one-file-system", "--inplace",
-                f"{src_mnt}/", f"{dst_mnt}/"
-            ])
+
+            rsync_opts = "-aHAX --numeric-ids --one-file-system --inplace"
+            if fpsync_workers:
+                cmd = ["fpsync", "-n", str(fpsync_workers), "-v", "-o", rsync_opts, f"{src_mnt}/", f"{dst_mnt}/"]
+            else:
+                cmd = ["rsync"] + rsync_opts.split() + [f"{src_mnt}/", f"{dst_mnt}/"]
+            run_cmd(cmd)
         finally:
             subprocess.run(["umount", "-l", dst_mnt], stderr=subprocess.DEVNULL)
             if os.path.exists(dst_mnt):
@@ -113,6 +135,7 @@ def clone_target(target, layout, src_mnt):
         print(f"Finished {disk}")
     except Exception as e:
         print(f"FAILED {disk}: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -133,6 +156,7 @@ def main():
     print("Insert cards. Press Enter when finished.")
 
     import select
+
     while True:
         if select.select([sys.stdin], [], [], 0.1)[0]:
             sys.stdin.readline()
@@ -170,7 +194,12 @@ def main():
         else:
             with ProcessPoolExecutor(max_workers=args.parallel) as executor:
                 # Map the shared source mount to all processes
-                executor.map(clone_target, targets, [layout] * len(targets), [src_mnt] * len(targets))
+                executor.map(
+                    clone_target,
+                    targets,
+                    [layout] * len(targets),
+                    [src_mnt] * len(targets),
+                )
     finally:
         print("Cleaning up source mount...")
         subprocess.run(["umount", src_mnt], stderr=subprocess.DEVNULL)
@@ -178,6 +207,7 @@ def main():
 
     os.sync()
     print("Done")
+
 
 if __name__ == "__main__":
     main()

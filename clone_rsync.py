@@ -66,8 +66,16 @@ def get_layout(args):
     min_fs_bytes = min_blocks * block_size
     required_total_bytes = (root_start * 512) + min_fs_bytes
 
+    # Get Disk ID (label-id) to preserve PARTUUIDs
+    disk_id = run_cmd(
+        f"sfdisk -d {source_disk_path} | grep 'label-id' | awk '{{print $2}}'",
+        shell=True,
+        capture=True,
+    )
+
     return {
         "source_disk": source_disk_path,
+        "disk_id": disk_id,
         "boot_dev": boot_dev,
         "root_dev": root_dev,
         "root_uuid": root_uuid,
@@ -97,7 +105,7 @@ def clone_target(args, layout, src_mnt, target):
     dst_mnt = os.path.abspath(f"./.tmp/dst_{target}")
     verbose = args.verbose
     if verbose:
-        print(f"--- Processing {disk} ---")
+        print(f"Processing {disk}")
     try:
         tgt_bytes = int(run_cmd(["blockdev", "--getsize64", disk], capture=True))
         if tgt_bytes < layout["required_total_bytes"]:
@@ -114,7 +122,7 @@ def clone_target(args, layout, src_mnt, target):
 
         # 2. Rebuild Partition Table
         sfdisk_input = (
-            f"label: dos\nunit: sectors\n"
+            f"label: dos\nlabel-id: {layout['disk_id']}\nunit: sectors\n"
             f"{disk}1 : start={layout['boot_start']}, size={layout['boot_size_sectors']}, type=c\n"
             f"{disk}2 : start={layout['root_start']}, type=83\n"
         )

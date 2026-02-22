@@ -58,7 +58,7 @@ def get_layout(args):
 
 
 def shrink_source(args, layout):
-    print(f"--- Shrinking Source: {layout['root_dev']} ---")
+    print(f"Shrinking Source: {layout['root_dev']}")
     root_dev = layout["root_dev"]
 
     # 1. Zero-fill root
@@ -180,7 +180,7 @@ def clone_target(args, layout, cutoff_byte, target):
 
 
 def restore_source(layout):
-    print("--- Restoring Source Disk ---")
+    print("Restoring Source Disk")
     run_cmd(
         [
             "parted",

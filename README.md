@@ -10,7 +10,7 @@ Comparison of cloning a 64GB device/partition to a 32GB device/partition (with 5
 
 | Method | Speed | Notes |
 | :--- | :--- | :--- |
-| `clone_dd.py` | 5m 19s | Shrink and expand source when the source is too large (can take a bit of time at startup if the source device has a lot of free space) |
+| `clone_dd.py` | 5m 59s | Shrink and expand source when the source is too large (can take a bit of time at startup if the source device has a lot of free space) |
 | `clone_dd.py --skip-zerofill` | 5m 19s | Direct `dd` of shrunken partition. |
 | `clone_rsync.py` | 5m | File-based copy; overhead from many small files. |
 | `clone_rsync.py --fpsync 8` | 4m 55s | Parallel file-based copy; reduces latency of small files. |

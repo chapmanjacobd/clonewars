@@ -222,114 +222,128 @@ def main():
     if os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
 
-    layout = get_layout(args)
-    source_end = (layout["root_start"] * 512) + layout["root_size"]
+    loop_dev = None
+    if os.path.isfile(args.source):
+        if args.verbose:
+            print(f"Setting up loop device for {args.source}...")
+        loop_dev = run_cmd(["losetup", "-fP", "--show", args.source], capture=True)
+        # Use the loop device as the source for the rest of the script
+        args.source = loop_dev
 
-    print(f"Source: {layout['source_disk']}")
-    print(f"Required: {source_end / 1e9:.2f} GB")
-
-    # Detection loop
-    baseline = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
-    targets = []
-    print("Insert cards. Press Enter when finished.")
-
-    import select
-
-    while True:
-        if select.select([sys.stdin], [], [], 0.1)[0]:
-            sys.stdin.readline()
-            break
-        current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
-        for dev in current - baseline:
-            if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
-                try:
-                    # Filter out empty slots (e.g., multi-card readers without media)
-                    size = int(
-                        run_cmd(
-                            ["blockdev", "--getsize64", f"/dev/{dev}"], capture=True
-                        )
-                    )
-                    if size > 0:
-                        targets.append(dev)
-                except Exception:
-                    continue
-        print(f"\rDetected: {len(targets)}", end="", flush=True)
-
-    if not targets:
-        print("\nNo targets found. Exiting.")
-        return
-
-    print(f"\nTargets:\n{'\n'.join(['/dev/' + t for t in targets])}")
-
-    # Find smallest target size
-    min_target_size = min(
-        int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
-        for t in targets
-    )
-    # Shrink if source partition end is within 64MB of or exceeds target capacity
-    needs_shrink = source_end > (min_target_size - 64 * 1024 * 1024)
-
-    if args.dry_run:
-        if needs_shrink:
-            # Estimate minimum size using resize2fs -P
-            block_size = int(
-                run_cmd(
-                    f"tune2fs -l {layout['root_dev']} | grep '^Block size' | awk '{{print $NF}}'",
-                    shell=True,
-                    capture=True,
-                )
-            )
-            min_blocks = int(
-                run_cmd(
-                    f"resize2fs -P {layout['root_dev']} 2>/dev/null | awk '{{print $NF}}'",
-                    shell=True,
-                    capture=True,
-                )
-            )
-            # Include the 200MB safety buffer used in shrink_source
-            required = (
-                (layout["root_start"] * 512)
-                + (min_blocks * block_size)
-                + (200 * 1024 * 1024)
-            )
-        else:
-            required = source_end
-
-        print(
-            f"\nDry run results (Required: {required / 1e9:.2f} GB, Needs Shrink: {needs_shrink}):"
-        )
-        for t in targets:
-            size = int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
-            status = "OK" if size >= required else "TOO SMALL"
-            print(f"  /dev/{t}: {status} ({size / 1e9:.2f} GB)")
-        return
-
-    # Phase preparation
-    if needs_shrink:
-        cutoff_byte = shrink_source(args, layout)
-    else:
-        cutoff_byte = source_end
-
-    input("\nPress Enter to start...")
-
-    # Clone Phase
     try:
-        if args.threads == 1:
-            for t in targets:
-                clone_target(args, layout, cutoff_byte, t)
-        else:
-            with ProcessPoolExecutor(max_workers=args.threads) as executor:
-                executor.map(
-                    clone_target,
-                    [args] * len(targets),
-                    [layout] * len(targets),
-                    [cutoff_byte] * len(targets),
-                    targets,
+        layout = get_layout(args)
+        source_end = (layout["root_start"] * 512) + layout["root_size"]
+
+        print(f"Source: {layout['source_disk']}")
+        print(f"Required: {source_end / 1e9:.2f} GB")
+
+        # Detection loop
+        baseline = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
+        targets = []
+        print("Insert cards. Press Enter when finished.")
+
+        import select
+
+        while True:
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                sys.stdin.readline()
+                break
+            current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
+            for dev in current - baseline:
+                if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
+                    try:
+                        # Filter out empty slots (e.g., multi-card readers without media)
+                        size = int(
+                            run_cmd(
+                                ["blockdev", "--getsize64", f"/dev/{dev}"], capture=True
+                            )
+                        )
+                        if size > 0:
+                            targets.append(dev)
+                    except Exception:
+                        continue
+            print(f"\rDetected: {len(targets)}", end="", flush=True)
+
+        if not targets:
+            print("\nNo targets found. Exiting.")
+            return
+
+        print(f"\nTargets:\n{'\n'.join(['/dev/' + t for t in targets])}")
+
+        # Find smallest target size
+        min_target_size = min(
+            int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
+            for t in targets
+        )
+        # Shrink if source partition end is within 64MB of or exceeds target capacity
+        needs_shrink = source_end > (min_target_size - 64 * 1024 * 1024)
+
+        if args.dry_run:
+            if needs_shrink:
+                # Estimate minimum size using resize2fs -P
+                block_size = int(
+                    run_cmd(
+                        f"tune2fs -l {layout['root_dev']} | grep '^Block size' | awk '{{print $NF}}'",
+                        shell=True,
+                        capture=True,
+                    )
                 )
-    finally:
-        # Expansion Phase (Ensure source is restored even if clone fails)
+                min_blocks = int(
+                    run_cmd(
+                        f"resize2fs -P {layout['root_dev']} 2>/dev/null | awk '{{print $NF}}'",
+                        shell=True,
+                        capture=True,
+                    )
+                )
+                # Include the 200MB safety buffer used in shrink_source
+                required = (
+                    (layout["root_start"] * 512)
+                    + (min_blocks * block_size)
+                    + (200 * 1024 * 1024)
+                )
+            else:
+                required = source_end
+
+            print(
+                f"\nDry run results (Required: {required / 1e9:.2f} GB, Needs Shrink: {needs_shrink}):"
+            )
+            for t in targets:
+                size = int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
+                status = "OK" if size >= required else "TOO SMALL"
+                print(f"  /dev/{t}: {status} ({size / 1e9:.2f} GB)")
+            return
+
+        # Phase preparation
         if needs_shrink:
-            restore_source(layout)
+            cutoff_byte = shrink_source(args, layout)
+        else:
+            cutoff_byte = source_end
+
+        input("\nPress Enter to start...")
+
+        # Clone Phase
+        try:
+            if args.threads == 1:
+                for t in targets:
+                    clone_target(args, layout, cutoff_byte, t)
+            else:
+                with ProcessPoolExecutor(max_workers=args.threads) as executor:
+                    executor.map(
+                        clone_target,
+                        [args] * len(targets),
+                        [layout] * len(targets),
+                        [cutoff_byte] * len(targets),
+                        targets,
+                    )
+        finally:
+            # Expansion Phase (Ensure source is restored even if clone fails)
+            if needs_shrink:
+                restore_source(layout)
+    finally:
+        if loop_dev:
+            if args.verbose:
+                print(f"Detaching {loop_dev}...")
+            run_cmd(["losetup", "-d", loop_dev])
 
     os.sync()
     print("Done")

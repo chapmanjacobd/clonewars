@@ -215,79 +215,93 @@ def main():
     if os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
 
-    layout = get_layout(args)
-    print(f"Source: {layout['source_disk']}")
-    print(f"Required: {layout['required_total_bytes'] / 1e9:.2f} GB")
-
-    baseline = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
-    targets = []
-    print("Insert cards. Press Enter when finished.")
-
-    import select
-
-    while True:
-        if select.select([sys.stdin], [], [], 0.1)[0]:
-            sys.stdin.readline()
-            break
-        current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
-        for dev in current - baseline:
-            if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
-                try:
-                    # Filter out empty slots (e.g., multi-card readers without media)
-                    size = int(
-                        run_cmd(
-                            ["blockdev", "--getsize64", f"/dev/{dev}"], capture=True
-                        )
-                    )
-                    if size > 0:
-                        targets.append(dev)
-                except Exception:
-                    continue
-        print(f"\rDetected: {len(targets)}", end="", flush=True)
-
-    if not targets:
-        print("\nNo targets.")
-        return
-
-    print(f"\nTargets:\n{'\n'.join(['/dev/' + t for t in targets])}")
-
-    if args.dry_run:
-        print("\nDry run results:")
-        for t in targets:
-            size = int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
-            status = "OK" if size >= layout["required_total_bytes"] else "TOO SMALL"
-            print(f"  /dev/{t}: {status} ({size / 1e9:.2f} GB)")
-        return
-
-    input("\nPress Enter to start...")
-
-    # Mount source root partition once
-    src_mnt = os.path.abspath("./.tmp/shared_src_root")
-    os.makedirs(src_mnt, exist_ok=True)
-    if args.verbose:
-        print(f"Mounting source {layout['root_dev']} to {src_mnt}...")
-    run_cmd(["mount", "-o", "ro", layout["root_dev"], src_mnt])
+    loop_dev = None
+    if os.path.isfile(args.source):
+        if args.verbose:
+            print(f"Setting up loop device for {args.source}...")
+        loop_dev = run_cmd(["losetup", "-fP", "--show", args.source], capture=True)
+        # Use the loop device as the source for the rest of the script
+        args.source = loop_dev
 
     try:
-        if args.threads == 1:
+        layout = get_layout(args)
+        print(f"Source: {layout['source_disk']}")
+        print(f"Required: {layout['required_total_bytes'] / 1e9:.2f} GB")
+
+        baseline = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
+        targets = []
+        print("Insert cards. Press Enter when finished.")
+
+        import select
+
+        while True:
+            if select.select([sys.stdin], [], [], 0.1)[0]:
+                sys.stdin.readline()
+                break
+            current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
+            for dev in current - baseline:
+                if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
+                    try:
+                        # Filter out empty slots (e.g., multi-card readers without media)
+                        size = int(
+                            run_cmd(
+                                ["blockdev", "--getsize64", f"/dev/{dev}"], capture=True
+                            )
+                        )
+                        if size > 0:
+                            targets.append(dev)
+                    except Exception:
+                        continue
+            print(f"\rDetected: {len(targets)}", end="", flush=True)
+
+        if not targets:
+            print("\nNo targets.")
+            return
+
+        print(f"\nTargets:\n{'\n'.join(['/dev/' + t for t in targets])}")
+
+        if args.dry_run:
+            print("\nDry run results:")
             for t in targets:
-                clone_target(args, layout, src_mnt, t)
-        else:
-            with ProcessPoolExecutor(max_workers=args.threads) as executor:
-                # Map the shared source mount to all processes
-                executor.map(
-                    clone_target,
-                    [args] * len(targets),
-                    [layout] * len(targets),
-                    [src_mnt] * len(targets),
-                    targets,
-                )
-    finally:
+                size = int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
+                status = "OK" if size >= layout["required_total_bytes"] else "TOO SMALL"
+                print(f"  /dev/{t}: {status} ({size / 1e9:.2f} GB)")
+            return
+
+        input("\nPress Enter to start...")
+
+        # Mount source root partition once
+        src_mnt = os.path.abspath("./.tmp/shared_src_root")
+        os.makedirs(src_mnt, exist_ok=True)
         if args.verbose:
-            print("Cleaning up source mount...")
-        subprocess.run(["umount", src_mnt], stderr=subprocess.DEVNULL)
-        if os.path.exists(src_mnt):
-            os.rmdir(src_mnt)
+            print(f"Mounting source {layout['root_dev']} to {src_mnt}...")
+        run_cmd(["mount", "-o", "ro", layout["root_dev"], src_mnt])
+
+        try:
+            if args.threads == 1:
+                for t in targets:
+                    clone_target(args, layout, src_mnt, t)
+            else:
+                with ProcessPoolExecutor(max_workers=args.threads) as executor:
+                    # Map the shared source mount to all processes
+                    executor.map(
+                        clone_target,
+                        [args] * len(targets),
+                        [layout] * len(targets),
+                        [src_mnt] * len(targets),
+                        targets,
+                    )
+        finally:
+            if args.verbose:
+                print("Cleaning up source mount...")
+            subprocess.run(["umount", src_mnt], stderr=subprocess.DEVNULL)
+            if os.path.exists(src_mnt):
+                os.rmdir(src_mnt)
+    finally:
+        if loop_dev:
+            if args.verbose:
+                print(f"Detaching {loop_dev}...")
+            run_cmd(["losetup", "-d", loop_dev])
 
     os.sync()
     print("Done")

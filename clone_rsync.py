@@ -13,6 +13,12 @@ def run_cmd(cmd, shell=False, capture=False):
 
 
 def get_layout(args):
+    # Detect base source disk (e.g., /dev/sdb)
+    source_disk = run_cmd(f"lsblk -no PKNAME {args.source} | head -n1", shell=True, capture=True)
+    if not source_disk:  # If args.source is already a disk, not a partition
+        source_disk = args.source.replace("/dev/", "")
+    source_disk_path = f"/dev/{source_disk}"
+
     boot_part = run_cmd(
         f"lsblk -ln -o NAME,FSTYPE {args.source} | awk '$2==\"vfat\"{{print $1}}'",
         shell=True,
@@ -57,6 +63,7 @@ def get_layout(args):
     required_total_bytes = (root_start * 512) + min_fs_bytes
 
     return {
+        "source_disk": source_disk_path,
         "boot_dev": boot_dev,
         "root_dev": root_dev,
         "root_uuid": root_uuid,
@@ -79,10 +86,12 @@ def get_partition_nodes(disk):
         return None, None
 
 
-def clone_target(target, layout, src_mnt, fpsync_workers=None):
+def clone_target(args, layout, src_mnt, target):
     disk = f"/dev/{target}"
-    dst_mnt = f"/tmp/dst_{target}"
-    print(f"--- Processing {disk} ---")
+    dst_mnt = os.path.abspath(f"./.tmp/dst_{target}")
+    verbose = args.verbose
+    if verbose:
+        print(f"--- Processing {disk} ---")
     try:
         tgt_bytes = int(run_cmd(["blockdev", "--getsize64", disk], capture=True))
         if tgt_bytes < layout["required_total_bytes"]:
@@ -90,8 +99,12 @@ def clone_target(target, layout, src_mnt, fpsync_workers=None):
             return
 
         # 1. Prepare Target
-        subprocess.run(f"mount | grep '^{disk}' | cut -d' ' -f1 | xargs -r umount", shell=True)
-        run_cmd(["wipefs", "-a", disk])
+        subprocess.run(
+            f"mount | grep '^{disk}' | cut -d' ' -f1 | xargs -r umount",
+            shell=True,
+            capture_output=not verbose,
+        )
+        run_cmd(["wipefs", "-a", disk], capture=not verbose)
 
         # 2. Rebuild Partition Table
         sfdisk_input = (
@@ -99,56 +112,103 @@ def clone_target(target, layout, src_mnt, fpsync_workers=None):
             f"{disk}1 : start={layout['boot_start']}, size={layout['boot_size_sectors']}, type=c\n"
             f"{disk}2 : start={layout['root_start']}, type=83\n"
         )
-        subprocess.run(["sfdisk", disk], input=sfdisk_input, text=True, check=True)
-        run_cmd(["udevadm", "settle"])
-        run_cmd(["partprobe", disk])
+        subprocess.run(
+            ["sfdisk", disk],
+            input=sfdisk_input,
+            text=True,
+            check=True,
+            capture_output=not verbose,
+        )
+        run_cmd(["udevadm", "settle"], capture=not verbose)
+        run_cmd(["partprobe", disk], capture=not verbose)
         time.sleep(1)
 
         p1, p2 = get_partition_nodes(disk)
 
         # 3. Format Root with Source UUID and copy Boot
-        print(f"[{target}] Formatting {p2} with UUID {layout['root_uuid']}...")
-        run_cmd(["mkfs.ext4", "-q", "-F", "-U", layout["root_uuid"], p2])
-        run_cmd(["tune2fs", "-m", "1", p2])
+        if verbose:
+            print(f"[{target}] Formatting {p2} with UUID {layout['root_uuid']}...")
+        run_cmd(
+            ["mkfs.ext4", "-q", "-F", "-U", layout["root_uuid"], p2],
+            capture=not verbose,
+        )
+        run_cmd(["tune2fs", "-m", "1", p2], capture=not verbose)
 
-        print(f"[{target}] Streaming boot partition to {p1}...")
-        run_cmd(["dd", f"if={layout['boot_dev']}", f"of={p1}", "bs=4M", "conv=fsync"])
+        if verbose:
+            print(f"[{target}] Streaming boot partition to {p1}...")
+        run_cmd(
+            [
+                "dd",
+                f"if={layout['boot_dev']}",
+                f"of={p1}",
+                "bs=4M",
+                "conv=sparse,fsync",
+            ],
+            capture=not verbose,
+        )
 
-        # 4. Sync Files via Rsync
-        print(f"[{target}] Syncing files from shared source...")
+        # 4. Sync Files via Rsync/Fpsync
+        if verbose:
+            print(f"[{target}] Syncing files from shared source...")
         os.makedirs(dst_mnt, exist_ok=True)
         try:
-            run_cmd(["mount", p2, dst_mnt])
+            run_cmd(["mount", p2, dst_mnt], capture=not verbose)
 
-            rsync_opts = "-aHAX --numeric-ids --one-file-system --inplace"
-            if fpsync_workers:
-                cmd = ["fpsync", "-n", str(fpsync_workers), "-v", "-o", rsync_opts, f"{src_mnt}/", f"{dst_mnt}/"]
+            if args.fpsync:
+                cmd = [
+                    "fpsync",
+                    "-n",
+                    str(args.fpsync),
+                    "-v",
+                    "-o",
+                    r'-lptgoDHAX --numeric-ids --inplace --filter=-x\ security.selinux',
+                ]
             else:
-                cmd = ["rsync"] + rsync_opts.split() + [f"{src_mnt}/", f"{dst_mnt}/"]
-            run_cmd(cmd)
+                cmd = [
+                    "rsync",
+                    "-aHAX",
+                    "--numeric-ids",
+                    "--inplace",
+                    "--filter=-x security.selinux",
+                    "--one-file-system",
+                ]
+            run_cmd(cmd + [f"{src_mnt}/", f"{dst_mnt}/"], capture=not verbose)
         finally:
-            subprocess.run(["umount", "-l", dst_mnt], stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["umount", "-l", dst_mnt],
+                stderr=subprocess.DEVNULL,
+                capture_output=not verbose,
+            )
             if os.path.exists(dst_mnt):
                 os.rmdir(dst_mnt)
 
-        run_cmd(["blockdev", "--flushbufs", disk])
-        print(f"Finished {disk}")
+        run_cmd(["blockdev", "--flushbufs", disk], capture=not verbose)
+        if verbose:
+            print(f"Finished {disk}")
     except Exception as e:
         print(f"FAILED {disk}: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("source")
-    parser.add_argument("mode", choices=["batch", "sequential"], default="batch", nargs="?")
-    parser.add_argument("parallel", type=int, default=20, nargs="?")
+    parser.add_argument("--fpsync", type=int, help="Use fpsync with N workers instead of rsync")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="Number of parallel clones (1 = sequential)",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("-n", "--dry-run", action="store_true")
+
+    parser.add_argument("source")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
 
     layout = get_layout(args)
+    print(f"Source: {layout['source_disk']}")
     print(f"Required: {layout['required_total_bytes'] / 1e9:.2f} GB")
 
     baseline = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
@@ -163,13 +223,15 @@ def main():
             break
         current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
         for dev in current - baseline:
-            if dev not in targets:
+            if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
                 targets.append(dev)
         print(f"\rDetected: {len(targets)}", end="", flush=True)
 
     if not targets:
         print("\nNo targets.")
         return
+
+    print(f"\nTargets:\n{'\n'.join(['/dev/' + t for t in targets])}")
 
     if args.dry_run:
         print("\nDry run results:")
@@ -182,28 +244,32 @@ def main():
     input("\nPress Enter to start...")
 
     # Mount source root partition once
-    src_mnt = "/tmp/shared_src_root"
+    src_mnt = os.path.abspath("./.tmp/shared_src_root")
     os.makedirs(src_mnt, exist_ok=True)
-    print(f"Mounting source {layout['root_dev']} to {src_mnt}...")
+    if args.verbose:
+        print(f"Mounting source {layout['root_dev']} to {src_mnt}...")
     run_cmd(["mount", "-o", "ro", layout["root_dev"], src_mnt])
 
     try:
-        if args.mode == "sequential":
+        if args.threads == 1:
             for t in targets:
-                clone_target(t, layout, src_mnt)
+                clone_target(args, layout, src_mnt, t)
         else:
-            with ProcessPoolExecutor(max_workers=args.parallel) as executor:
+            with ProcessPoolExecutor(max_workers=args.threads) as executor:
                 # Map the shared source mount to all processes
                 executor.map(
                     clone_target,
-                    targets,
+                    [args] * len(targets),
                     [layout] * len(targets),
                     [src_mnt] * len(targets),
+                    targets,
                 )
     finally:
-        print("Cleaning up source mount...")
+        if args.verbose:
+            print("Cleaning up source mount...")
         subprocess.run(["umount", src_mnt], stderr=subprocess.DEVNULL)
-        os.rmdir(src_mnt)
+        if os.path.exists(src_mnt):
+            os.rmdir(src_mnt)
 
     os.sync()
     print("Done")

@@ -51,24 +51,30 @@ def get_layout(args):
         "root_start": int(
             run_cmd(["lsblk", "-b", "-no", "START", root_dev], capture=True)
         ),
+        "root_size": int(
+            run_cmd(["lsblk", "-b", "-no", "SIZE", root_dev], capture=True)
+        ),
     }
 
 
-def shrink_source(layout):
+def shrink_source(args, layout):
     print(f"--- Shrinking Source: {layout['root_dev']} ---")
     root_dev = layout["root_dev"]
 
     # 1. Zero-fill root
-    tmp_mnt = "/tmp/shrink_mnt"
-    os.makedirs(tmp_mnt, exist_ok=True)
-    try:
-        run_cmd(["mount", root_dev, tmp_mnt])
-        print("Zero-filling unused blocks...")
-        subprocess.run(f"cat /dev/zero > {tmp_mnt}/zero.fill || true", shell=True)
-        run_cmd(["rm", "-f", f"{tmp_mnt}/zero.fill"])
-        run_cmd(["umount", tmp_mnt])
-    except Exception as e:
-        print(f"Warning during zero-fill: {e}")
+    if not args.skip_zerofill:
+        tmp_mnt = os.path.abspath("./.tmp/shrink_mnt")
+        os.makedirs(tmp_mnt, exist_ok=True)
+        try:
+            run_cmd(["mount", root_dev, tmp_mnt])
+            print("Zero-filling unused blocks...")
+            subprocess.run(
+                f"cat /dev/zero > {tmp_mnt}/zero.fill 2>/dev/null || true", shell=True
+            )
+            run_cmd(["rm", "-f", f"{tmp_mnt}/zero.fill"])
+            run_cmd(["umount", tmp_mnt])
+        except Exception as e:
+            print(f"Warning during zero-fill: {e}")
 
     # 2. Shrink FS
     run_cmd(["e2fsck", "-p", "-f", root_dev])
@@ -97,36 +103,46 @@ def shrink_source(layout):
 
     # 4. Shrink Partition
     print(f"Resizing partition {layout['root_idx']} to end at {new_end_byte} bytes")
-    run_cmd(
-        [
-            "parted",
-            "---pretend-input-tty",
-            layout["source_disk"],
-            "unit",
-            "B",
-            "resizepart",
-            layout["root_idx"],
-            str(new_end_byte),
-        ]
+    cmd = [
+        "parted",
+        "---pretend-input-tty",
+        "---pretend-input-tty",
+        layout["source_disk"],
+        "unit",
+        "B",
+        "resizepart",
+        layout["root_idx"],
+        str(new_end_byte),
+    ]
+    yes_proc = subprocess.Popen(["yes", "Yes"], stdout=subprocess.PIPE)
+    subprocess.run(
+        cmd, stdin=yes_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+    yes_proc.terminate()
+
     run_cmd(["udevadm", "settle"])
 
     return new_end_byte
 
 
-def clone_target_dd(target, layout, cutoff_byte):
+def clone_target(args, layout, cutoff_byte, target):
     dest_disk = f"/dev/{target}"
-    print(f"Processing {dest_disk}")
+    verbose = args.verbose
+    if verbose:
+        print(f"Processing {dest_disk}")
     try:
         # 1. Unmount targets
         subprocess.run(
-            f"mount | grep '^{dest_disk}' | cut -d' ' -f1 | xargs -r umount", shell=True
+            f"mount | grep '^{dest_disk}' | cut -d' ' -f1 | xargs -r umount",
+            shell=True,
+            capture_output=not verbose,
         )
 
         # 2. Copy using DD
         # bs=4M is efficient for SD cards. count is calculated to stop after shrunken root.
         copy_count = math.ceil(cutoff_byte / (4 * 1024 * 1024))
-        print(f"[{target}] Copying {copy_count * 4}MB from source...")
+        if verbose:
+            print(f"[{target}] Copying {copy_count * 4}MB from source...")
         run_cmd(
             [
                 "dd",
@@ -134,14 +150,19 @@ def clone_target_dd(target, layout, cutoff_byte):
                 f"of={dest_disk}",
                 "bs=4M",
                 f"count={copy_count}",
-                "conv=fsync",
-            ]
+                "conv=sparse,fsync",
+            ],
+            capture=not verbose,
         )
 
-        # 3. Fix Partition Table and Expand Target
-        print(f"[{target}] Expanding partition to 100%...")
-        run_cmd(["parted", "-s", dest_disk, "resizepart", layout["root_idx"], "100%"])
-        run_cmd(["udevadm", "settle"])
+        # 3. Fix Partition Table and Expand Target (Always expand target)
+        if verbose:
+            print(f"[{target}] Expanding partition to 100%...")
+        run_cmd(
+            ["parted", "-s", dest_disk, "resizepart", layout["root_idx"], "100%"],
+            capture=not verbose,
+        )
+        run_cmd(["udevadm", "settle"], capture=not verbose)
 
         # Identify partition node on target (p2 or 2)
         out = run_cmd(
@@ -149,9 +170,11 @@ def clone_target_dd(target, layout, cutoff_byte):
         ).splitlines()
         p2 = f"/dev/{out[2].strip()}"  # index 0 is disk, 1 is boot, 2 is root
 
-        run_cmd(["e2fsck", "-p", "-f", p2])
-        run_cmd(["resize2fs", p2])
-        print(f"[{target}] Finished")
+        run_cmd(["e2fsck", "-p", "-f", p2], capture=not verbose)
+        run_cmd(["resize2fs", p2], capture=not verbose)
+
+        if verbose:
+            print(f"[{target}] Finished")
     except Exception as e:
         print(f"FAILED {dest_disk}: {e}")
 
@@ -173,24 +196,42 @@ def restore_source(layout):
 
 
 def main():
-    # TODO: add an option for source devices that don't need shrinking
     parser = argparse.ArgumentParser()
-    parser.add_argument("source", help="/dev/sdb or /dev/sdb2")
     parser.add_argument(
-        "mode", choices=["batch", "sequential"], default="batch", nargs="?"
+        "--skip-zerofill",
+        action="store_true",
+        help="Skip zero-filling the source filesystem",
     )
-    parser.add_argument("parallel", type=int, default=20, nargs="?")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="Number of parallel clones (1 = sequential)",
+    )
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="Dry run: show what would be done without modifying disks",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+
+    parser.add_argument("source", help="/dev/sdb or /dev/sdb2")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
         os.execvp("sudo", ["sudo", sys.executable] + sys.argv)
 
     layout = get_layout(args)
+    source_end = (layout["root_start"] * 512) + layout["root_size"]
+
+    print(f"Source: {layout['source_disk']}")
+    print(f"Required: {source_end / 1e9:.2f} GB")
 
     # Detection loop
     baseline = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
     targets = []
-    print(f"Source: {layout['source_disk']}. Insert targets and press ENTER.")
+    print("Insert cards. Press Enter when finished.")
 
     import select
 
@@ -208,28 +249,80 @@ def main():
         print("\nNo targets found. Exiting.")
         return
 
-    # Shrink Phase
-    cutoff_byte = shrink_source(layout)
+    print(f"\nTargets:\n{'\n'.join(['/dev/' + t for t in targets])}")
+
+    # Find smallest target size
+    min_target_size = min(
+        int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
+        for t in targets
+    )
+    # Shrink if source partition end is within 64MB of or exceeds target capacity
+    needs_shrink = source_end > (min_target_size - 64 * 1024 * 1024)
+
+    if args.dry_run:
+        if needs_shrink:
+            # Estimate minimum size using resize2fs -P
+            block_size = int(
+                run_cmd(
+                    f"tune2fs -l {layout['root_dev']} | grep '^Block size' | awk '{{print $NF}}'",
+                    shell=True,
+                    capture=True,
+                )
+            )
+            min_blocks = int(
+                run_cmd(
+                    f"resize2fs -P {layout['root_dev']} 2>/dev/null | awk '{{print $NF}}'",
+                    shell=True,
+                    capture=True,
+                )
+            )
+            # Include the 200MB safety buffer used in shrink_source
+            required = (
+                (layout["root_start"] * 512)
+                + (min_blocks * block_size)
+                + (200 * 1024 * 1024)
+            )
+        else:
+            required = source_end
+
+        print(
+            f"\nDry run results (Required: {required / 1e9:.2f} GB, Needs Shrink: {needs_shrink}):"
+        )
+        for t in targets:
+            size = int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
+            status = "OK" if size >= required else "TOO SMALL"
+            print(f"  /dev/{t}: {status} ({size / 1e9:.2f} GB)")
+        return
+
+    # Phase preparation
+    if needs_shrink:
+        cutoff_byte = shrink_source(args, layout)
+    else:
+        cutoff_byte = source_end
+
+    input("\nPress Enter to start...")
 
     # Clone Phase
     try:
-        if args.mode == "sequential":
+        if args.threads == 1:
             for t in targets:
-                clone_target_dd(t, layout, cutoff_byte)
+                clone_target(args, layout, cutoff_byte, t)
         else:
-            with ProcessPoolExecutor(max_workers=args.parallel) as executor:
+            with ProcessPoolExecutor(max_workers=args.threads) as executor:
                 executor.map(
-                    clone_target_dd,
-                    targets,
+                    clone_target,
+                    [args] * len(targets),
                     [layout] * len(targets),
                     [cutoff_byte] * len(targets),
+                    targets,
                 )
     finally:
         # Expansion Phase (Ensure source is restored even if clone fails)
-        restore_source(layout)
+        if needs_shrink:
+            restore_source(layout)
 
     os.sync()
-    print("\nAll tasks complete.")
+    print("Done")
 
 
 if __name__ == "__main__":

@@ -8,13 +8,17 @@ from concurrent.futures import ProcessPoolExecutor
 
 
 def run_cmd(cmd, shell=False, capture=False):
-    res = subprocess.run(cmd, shell=shell, check=True, text=True, capture_output=capture)
+    res = subprocess.run(
+        cmd, shell=shell, check=True, text=True, capture_output=capture
+    )
     return res.stdout.strip() if capture else res
 
 
 def get_layout(args):
     # Detect base source disk (e.g., /dev/sdb)
-    source_disk = run_cmd(f"lsblk -no PKNAME {args.source} | head -n1", shell=True, capture=True)
+    source_disk = run_cmd(
+        f"lsblk -no PKNAME {args.source} | head -n1", shell=True, capture=True
+    )
     if not source_disk:  # If args.source is already a disk, not a partition
         source_disk = args.source.replace("/dev/", "")
     source_disk_path = f"/dev/{source_disk}"
@@ -76,7 +80,9 @@ def get_layout(args):
 
 def get_partition_nodes(disk):
     try:
-        out = subprocess.check_output(["lsblk", "-ln", "-o", "NAME", disk], text=True).splitlines()
+        out = subprocess.check_output(
+            ["lsblk", "-ln", "-o", "NAME", disk], text=True
+        ).splitlines()
         partitions = [f"/dev/{p.strip()}" for p in out if f"/dev/{p.strip()}" != disk]
         if len(partitions) < 2:
             raise RuntimeError(f"Could not find at least 2 partitions on {disk}")
@@ -161,7 +167,7 @@ def clone_target(args, layout, src_mnt, target):
                     str(args.fpsync),
                     "-v",
                     "-o",
-                    r'-lptgoDHAX --numeric-ids --inplace --filter=-x\ security.selinux',
+                    r"-lptgoDHAX --numeric-ids --inplace --filter=-x\ security.selinux",
                 ]
             else:
                 cmd = [
@@ -191,7 +197,9 @@ def clone_target(args, layout, src_mnt, target):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fpsync", type=int, help="Use fpsync with N workers instead of rsync")
+    parser.add_argument(
+        "--fpsync", type=int, help="Use fpsync with N workers instead of rsync"
+    )
     parser.add_argument(
         "--threads",
         type=int,
@@ -224,7 +232,17 @@ def main():
         current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
         for dev in current - baseline:
             if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
-                targets.append(dev)
+                try:
+                    # Filter out empty slots (e.g., multi-card readers without media)
+                    size = int(
+                        run_cmd(
+                            ["blockdev", "--getsize64", f"/dev/{dev}"], capture=True
+                        )
+                    )
+                    if size > 0:
+                        targets.append(dev)
+                except Exception:
+                    continue
         print(f"\rDetected: {len(targets)}", end="", flush=True)
 
     if not targets:

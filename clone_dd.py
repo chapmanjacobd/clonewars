@@ -242,7 +242,17 @@ def main():
         current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
         for dev in current - baseline:
             if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
-                targets.append(dev)
+                try:
+                    # Filter out empty slots (e.g., multi-card readers without media)
+                    size = int(
+                        run_cmd(
+                            ["blockdev", "--getsize64", f"/dev/{dev}"], capture=True
+                        )
+                    )
+                    if size > 0:
+                        targets.append(dev)
+                except Exception:
+                    continue
         print(f"\rDetected: {len(targets)}", end="", flush=True)
 
     if not targets:

@@ -16,7 +16,7 @@
 
         ./clone_dd.py raspios.img
 
-2. Insert the USB Hub(s) with up to 5 daisy chains of powered USB Hubs (and up to the 32~96 limit of the processor/motherboard)
+2. Insert the USB Hub(s) with up to 5 daisy chains of powered USB Hubs (and up to the 32~96 limit of the [CPU](https://en.wikipedia.org/wiki/Southbridge_(computing)#Current_status))
 
 3. Wait for the screen to update with the number of devices that you expect
 

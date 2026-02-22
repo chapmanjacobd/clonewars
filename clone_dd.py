@@ -24,17 +24,19 @@ def get_layout(args):
     source_disk_path = f"/dev/{source_disk}"
 
     boot_part = run_cmd(
-        f"lsblk -ln -o NAME,FSTYPE {source_disk_path} | awk '$2==\"vfat\"{{print $1}}'",
+        f"lsblk -ln -o NAME,FSTYPE {source_disk_path} | awk '$2==\"vfat\"{{print $1}}' | head -n1",
         shell=True,
         capture=True,
     )
     root_part = run_cmd(
-        f"lsblk -ln -o NAME,FSTYPE {source_disk_path} | awk '$2 ~ /^ext/{{print $1}}'",
+        f"lsblk -ln -o NAME,FSTYPE {source_disk_path} | awk '$2 ~ /^ext/{{print $1}}' | head -n1",
         shell=True,
         capture=True,
     )
 
     if not boot_part or not root_part:
+        print(f"DEBUG: lsblk output for {source_disk_path}:")
+        print(run_cmd(f"lsblk -ln -o NAME,FSTYPE {source_disk_path}", shell=True, capture=True))
         print(f"Could not detect partitions on {source_disk_path}")
         sys.exit(1)
 
@@ -174,7 +176,7 @@ def clone_target(args, layout, cutoff_byte, target):
         run_cmd(["resize2fs", p2], capture=not verbose)
 
         if verbose:
-            print(f"[{target}] Finished")
+            print(f"[{target}] Complete")
     except Exception as e:
         print(f"FAILED {dest_disk}: {e}")
 
@@ -227,6 +229,8 @@ def main():
         if args.verbose:
             print(f"Setting up loop device for {args.source}...")
         loop_dev = run_cmd(["losetup", "-fP", "--show", args.source], capture=True)
+        run_cmd(["udevadm", "settle"])
+        run_cmd(["partprobe", loop_dev])
         # Use the loop device as the source for the rest of the script
         args.source = loop_dev
 
@@ -240,7 +244,7 @@ def main():
         # Detection loop
         baseline = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
         targets = []
-        print("Insert cards. Press Enter when finished.")
+        print("Insert cards. Press Enter when ready.")
 
         import select
 
@@ -319,7 +323,7 @@ def main():
         else:
             cutoff_byte = source_end
 
-        input("\nPress Enter to start...")
+        input("\nPress Enter to start... or ctrl-c to cancel")
 
         # Clone Phase
         try:
@@ -345,6 +349,7 @@ def main():
                 print(f"Detaching {loop_dev}...")
             run_cmd(["losetup", "-d", loop_dev])
 
+    print("Final Sync")
     os.sync()
     print("Done")
 

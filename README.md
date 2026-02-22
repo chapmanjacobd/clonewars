@@ -1,8 +1,26 @@
 # CloneWars
 
-`clone_rsync.py` will use `rsync` to copy the ext4 file tree without needing to shrink
+`clone_dd.py` (recommended) will shrink the source filesystem and then use `dd` to copy the ext4 filesystem
 
-`clone_dd.py` will shrink the source filesystem and then use `dd` to copy the ext4 filesystem
+`clone_rsync.py` will use `rsync` to copy the ext4 file tree without needing to shrink (more of a proof of concept to try and understand how commercial duplicators are able to write to smaller devices)
+
+## Usage
+
+1. Start the program
+
+    Insert the source USB drive:
+
+        ./clone_dd.py /dev/sdc
+
+    Or reference an image file:
+
+        ./clone_dd.py raspios.img
+
+2. Insert the USB Hub(s) with up to 5 daisy chains of powered USB Hubs (and up to the 32~96 limit of the processor/motherboard)
+
+3. Wait for the screen to update with the number of devices that you expect
+
+4. Press enter to start batch cloning
 
 ## Benchmark
 

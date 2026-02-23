@@ -23,24 +23,66 @@ def get_layout(args):
         source_disk = args.source.replace("/dev/", "")
     source_disk_path = f"/dev/{source_disk}"
 
-    boot_part = run_cmd(
-        f"lsblk -ln -o NAME,FSTYPE {source_disk_path} | awk '$2==\"vfat\"{{print $1}}' | head -n1",
-        shell=True,
-        capture=True,
-    )
-    root_part = run_cmd(
-        f"lsblk -ln -o NAME,FSTYPE {source_disk_path} | awk '$2 ~ /^ext/{{print $1}}' | head -n1",
-        shell=True,
-        capture=True,
-    )
+    # Get all partitions with their names and fstypes
+    parts = run_cmd(
+        f"lsblk -ln -o NAME,FSTYPE {source_disk_path}", shell=True, capture=True
+    ).splitlines()
 
-    if not boot_part or not root_part:
+    # Filter out the disk itself (first entry usually, but let's be safe)
+    # lsblk -ln -o NAME,FSTYPE /dev/sdb gives:
+    # sdb
+    # sdb1 vfat
+    # sdb2 ext4
+
+    partition_list = []
+    for line in parts:
+        parts_split = line.split()
+        if len(parts_split) < 1:
+            continue
+        name = parts_split[0]
+        fstype = parts_split[1] if len(parts_split) > 1 else ""
+
+        if name != source_disk:
+            if not fstype:
+                try:
+                    fstype = run_cmd(
+                        f"blkid -s TYPE -o value /dev/{name}", shell=True, capture=True
+                    )
+                except Exception:
+                    fstype = ""
+            partition_list.append({"name": name, "fstype": fstype})
+
+    boot_dev = None
+    root_dev = None
+    root_fstype = None
+
+    if len(partition_list) == 1:
+        # Single partition case
+        root_dev = f"/dev/{partition_list[0]['name']}"
+        root_fstype = partition_list[0]["fstype"]
+    else:
+        # Try to find boot (vfat) and root (ext)
+        for p in partition_list:
+            if p["fstype"] == "vfat" and not boot_dev:
+                boot_dev = f"/dev/{p['name']}"
+            elif p["fstype"].startswith("ext") and not root_dev:
+                root_dev = f"/dev/{p['name']}"
+                root_fstype = p["fstype"]
+
+        # Fallback: if we didn't find the classic pair, use the last partition as root
+        if not root_dev and partition_list:
+            root_dev = f"/dev/{partition_list[-1]['name']}"
+            root_fstype = partition_list[-1]["fstype"]
+
+    if not root_dev:
         print(f"DEBUG: lsblk output for {source_disk_path}:")
-        print(run_cmd(f"lsblk -ln -o NAME,FSTYPE {source_disk_path}", shell=True, capture=True))
+        print(
+            run_cmd(
+                f"lsblk -ln -o NAME,FSTYPE {source_disk_path}", shell=True, capture=True
+            )
+        )
         print(f"Could not detect partitions on {source_disk_path}")
         sys.exit(1)
-
-    boot_dev, root_dev = f"/dev/{boot_part}", f"/dev/{root_part}"
 
     # Get index for resizepart (e.g., /dev/sdb2 -> 2)
     root_idx = run_cmd(f"lsblk -no PARTN {root_dev}", shell=True, capture=True)
@@ -49,6 +91,7 @@ def get_layout(args):
         "source_disk": source_disk_path,
         "boot_dev": boot_dev,
         "root_dev": root_dev,
+        "root_fstype": root_fstype,
         "root_idx": root_idx,
         "root_start": int(
             run_cmd(["lsblk", "-b", "-no", "START", root_dev], capture=True)
@@ -60,8 +103,15 @@ def get_layout(args):
 
 
 def shrink_source(args, layout):
-    print(f"Shrinking Source: {layout['root_dev']}")
     root_dev = layout["root_dev"]
+    fstype = layout["root_fstype"]
+
+    if not fstype or not fstype.startswith("ext"):
+        if args.verbose:
+            print(f"Skipping shrink for non-ext filesystem: {fstype}")
+        return (layout["root_start"] * 512) + layout["root_size"]
+
+    print(f"Shrinking Source: {root_dev} ({fstype})")
 
     # 1. Zero-fill root
     if not args.skip_zerofill:
@@ -166,14 +216,22 @@ def clone_target(args, layout, cutoff_byte, target):
         )
         run_cmd(["udevadm", "settle"], capture=not verbose)
 
-        # Identify partition node on target (p2 or 2)
-        out = run_cmd(
-            ["lsblk", "-ln", "-o", "NAME", dest_disk], capture=True
-        ).splitlines()
-        p2 = f"/dev/{out[2].strip()}"  # index 0 is disk, 1 is boot, 2 is root
+        # Identify partition node on target using PARTN
+        root_tgt_name = run_cmd(
+            f"lsblk -ln -o NAME,PARTN {dest_disk} | awk '$2==\"{layout['root_idx']}\" {{print $1}}'",
+            shell=True,
+            capture=True,
+        )
+        if not root_tgt_name:
+            print(
+                f"[{target}] FAILED: Could not find partition {layout['root_idx']} on target"
+            )
+            return
+        root_tgt = f"/dev/{root_tgt_name}"
 
-        run_cmd(["e2fsck", "-p", "-f", p2], capture=not verbose)
-        run_cmd(["resize2fs", p2], capture=not verbose)
+        if layout["root_fstype"] and layout["root_fstype"].startswith("ext"):
+            run_cmd(["e2fsck", "-p", "-f", root_tgt], capture=not verbose)
+            run_cmd(["resize2fs", root_tgt], capture=not verbose)
 
         if verbose:
             print(f"[{target}] Complete")
@@ -194,7 +252,8 @@ def restore_source(layout):
         ]
     )
     run_cmd(["udevadm", "settle"])
-    run_cmd(["resize2fs", layout["root_dev"]])
+    if layout["root_fstype"] and layout["root_fstype"].startswith("ext"):
+        run_cmd(["resize2fs", layout["root_dev"]])
 
 
 def main():
@@ -254,7 +313,9 @@ def main():
                 break
             current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
             for dev in current - baseline:
-                if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
+                if dev not in targets and dev != layout["source_disk"].replace(
+                    "/dev/", ""
+                ):
                     try:
                         # Filter out empty slots (e.g., multi-card readers without media)
                         size = int(
@@ -312,7 +373,9 @@ def main():
                 f"\nDry run results (Required: {required / 1e9:.2f} GB, Needs Shrink: {needs_shrink}):"
             )
             for t in targets:
-                size = int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
+                size = int(
+                    run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True)
+                )
                 status = "OK" if size >= required else "TOO SMALL"
                 print(f"  /dev/{t}: {status} ({size / 1e9:.2f} GB)")
             return

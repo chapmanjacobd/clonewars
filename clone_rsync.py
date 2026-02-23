@@ -23,49 +23,97 @@ def get_layout(args):
         source_disk = args.source.replace("/dev/", "")
     source_disk_path = f"/dev/{source_disk}"
 
-    boot_part = run_cmd(
-        f"lsblk -ln -o NAME,FSTYPE {source_disk_path} | awk '$2==\"vfat\"{{print $1}}' | head -n1",
-        shell=True,
-        capture=True,
-    )
-    root_part = run_cmd(
-        f"lsblk -ln -o NAME,FSTYPE {source_disk_path} | awk '$2 ~ /^ext/{{print $1}}' | head -n1",
-        shell=True,
-        capture=True,
-    )
+    # Get all partitions with their names and fstypes
+    parts = run_cmd(
+        f"lsblk -ln -o NAME,FSTYPE {source_disk_path}", shell=True, capture=True
+    ).splitlines()
 
-    if not boot_part or not root_part:
+    partition_list = []
+    for line in parts:
+        parts_split = line.split()
+        if len(parts_split) < 1:
+            continue
+        name = parts_split[0]
+        fstype = parts_split[1] if len(parts_split) > 1 else ""
+
+        if name != source_disk:
+            if not fstype:
+                try:
+                    fstype = run_cmd(
+                        f"blkid -s TYPE -o value /dev/{name}", shell=True, capture=True
+                    )
+                except Exception:
+                    fstype = ""
+            partition_list.append({"name": name, "fstype": fstype})
+
+    boot_dev = None
+    root_dev = None
+    root_fstype = None
+
+    if len(partition_list) == 1:
+        # Single partition case
+        root_dev = f"/dev/{partition_list[0]['name']}"
+        root_fstype = partition_list[0]["fstype"]
+    else:
+        # Try to find boot (vfat) and root (ext)
+        for p in partition_list:
+            if p["fstype"] == "vfat" and not boot_dev:
+                boot_dev = f"/dev/{p['name']}"
+            elif p["fstype"].startswith("ext") and not root_dev:
+                root_dev = f"/dev/{p['name']}"
+                root_fstype = p["fstype"]
+
+        # Fallback: if we didn't find the classic pair, use the last partition as root
+        if not root_dev and partition_list:
+            root_dev = f"/dev/{partition_list[-1]['name']}"
+            root_fstype = partition_list[-1]["fstype"]
+
+    if not root_dev:
         print(f"DEBUG: lsblk output for {source_disk_path}:")
-        print(run_cmd(f"lsblk -ln -o NAME,FSTYPE {source_disk_path}", shell=True, capture=True))
-        print("Could not detect boot (vfat) and root (ext) partitions")
+        print(
+            run_cmd(
+                f"lsblk -ln -o NAME,FSTYPE {source_disk_path}", shell=True, capture=True
+            )
+        )
+        print(f"Could not detect partitions on {source_disk_path}")
         sys.exit(1)
-
-    boot_dev = f"/dev/{boot_part}"
-    root_dev = f"/dev/{root_part}"
 
     # Get UUID of source root
     root_uuid = run_cmd(f"blkid -s UUID -o value {root_dev}", shell=True, capture=True)
-
-    boot_start = int(run_cmd(["lsblk", "-b", "-no", "START", boot_dev], capture=True))
-    boot_size = int(run_cmd(["lsblk", "-b", "-no", "SIZE", boot_dev], capture=True))
     root_start = int(run_cmd(["lsblk", "-b", "-no", "START", root_dev], capture=True))
 
-    block_size = int(
-        run_cmd(
-            f"dumpe2fs -h {root_dev} 2>/dev/null | awk -F: '/Block size/ {{gsub(/ /,\"\"); print $2}}'",
-            shell=True,
-            capture=True,
+    boot_start = 0
+    boot_size_sectors = 0
+    if boot_dev:
+        boot_start = int(
+            run_cmd(["lsblk", "-b", "-no", "START", boot_dev], capture=True)
         )
-    )
-    min_blocks = int(
-        run_cmd(
-            f"resize2fs -P {root_dev} 2>/dev/null | awk '{{print $NF}}'",
-            shell=True,
-            capture=True,
-        )
-    )
+        boot_size = int(run_cmd(["lsblk", "-b", "-no", "SIZE", boot_dev], capture=True))
+        boot_size_sectors = boot_size // 512
 
-    min_fs_bytes = min_blocks * block_size
+    # Estimation of required total bytes
+    if root_fstype.startswith("ext"):
+        block_size = int(
+            run_cmd(
+                f"dumpe2fs -h {root_dev} 2>/dev/null | awk -F: '/Block size/ {{gsub(/ /,\"\"); print $2}}'",
+                shell=True,
+                capture=True,
+            )
+        )
+        min_blocks = int(
+            run_cmd(
+                f"resize2fs -P {root_dev} 2>/dev/null | awk '{{print $NF}}'",
+                shell=True,
+                capture=True,
+            )
+        )
+        min_fs_bytes = min_blocks * block_size
+    else:
+        # For non-ext, just use the current partition size as estimate
+        min_fs_bytes = int(
+            run_cmd(["lsblk", "-b", "-no", "SIZE", root_dev], capture=True)
+        )
+
     required_total_bytes = (root_start * 512) + min_fs_bytes
 
     # Get Disk ID (label-id) to preserve PARTUUIDs
@@ -81,10 +129,12 @@ def get_layout(args):
         "boot_dev": boot_dev,
         "root_dev": root_dev,
         "root_uuid": root_uuid,
+        "root_fstype": root_fstype,
         "boot_start": boot_start,
-        "boot_size_sectors": boot_size // 512,
+        "boot_size_sectors": boot_size_sectors,
         "root_start": root_start,
         "required_total_bytes": required_total_bytes,
+        "is_single_partition": boot_dev is None,
     }
 
 
@@ -93,13 +143,16 @@ def get_partition_nodes(disk):
         out = subprocess.check_output(
             ["lsblk", "-ln", "-o", "NAME", disk], text=True
         ).splitlines()
-        partitions = [f"/dev/{p.strip()}" for p in out if f"/dev/{p.strip()}" != disk]
-        if len(partitions) < 2:
-            raise RuntimeError(f"Could not find at least 2 partitions on {disk}")
-        return partitions[0], partitions[1]
+        # Filter to only keep partitions (children of the disk)
+        partitions = []
+        for line in out:
+            p = line.strip()
+            if p and f"/dev/{p}" != disk:
+                partitions.append(f"/dev/{p}")
+        return partitions
     except Exception as e:
         print(f"Error resolving partitions for {disk}: {e}")
-        return None, None
+        return []
 
 
 def clone_target(args, layout, src_mnt, target):
@@ -123,11 +176,18 @@ def clone_target(args, layout, src_mnt, target):
         run_cmd(["wipefs", "-a", disk], capture=not verbose)
 
         # 2. Rebuild Partition Table
-        sfdisk_input = (
-            f"label: dos\nlabel-id: {layout['disk_id']}\nunit: sectors\n"
-            f"{disk}1 : start={layout['boot_start']}, size={layout['boot_size_sectors']}, type=c\n"
-            f"{disk}2 : start={layout['root_start']}, type=83\n"
-        )
+        if layout["is_single_partition"]:
+            sfdisk_input = (
+                f"label: dos\nlabel-id: {layout['disk_id']}\nunit: sectors\n"
+                f"{disk}1 : start={layout['root_start']}, type=83\n"
+            )
+        else:
+            sfdisk_input = (
+                f"label: dos\nlabel-id: {layout['disk_id']}\nunit: sectors\n"
+                f"{disk}1 : start={layout['boot_start']}, size={layout['boot_size_sectors']}, type=c\n"
+                f"{disk}2 : start={layout['root_start']}, type=83\n"
+            )
+
         subprocess.run(
             ["sfdisk", disk],
             input=sfdisk_input,
@@ -139,36 +199,71 @@ def clone_target(args, layout, src_mnt, target):
         run_cmd(["partprobe", disk], capture=not verbose)
         time.sleep(1)
 
-        p1, p2 = get_partition_nodes(disk)
+        partitions = get_partition_nodes(disk)
+        if layout["is_single_partition"]:
+            if len(partitions) < 1:
+                raise RuntimeError(f"Could not find partitions on {disk}")
+            p_root = partitions[0]
+            p_boot = None
+        else:
+            if len(partitions) < 2:
+                raise RuntimeError(f"Could not find 2 partitions on {disk}")
+            p_boot = partitions[0]
+            p_root = partitions[1]
 
-        # 3. Format Root with Source UUID and copy Boot
+        # 3. Format Root and copy Boot
         if verbose:
-            print(f"[{target}] Formatting {p2} with UUID {layout['root_uuid']}...")
-        run_cmd(
-            ["mkfs.ext4", "-q", "-F", "-U", layout["root_uuid"], p2],
-            capture=not verbose,
-        )
-        run_cmd(["tune2fs", "-m", "1", p2], capture=not verbose)
+            print(f"[{target}] Formatting {p_root} as {layout['root_fstype']}...")
 
-        if verbose:
-            print(f"[{target}] Streaming boot partition to {p1}...")
-        run_cmd(
-            [
-                "dd",
-                f"if={layout['boot_dev']}",
-                f"of={p1}",
-                "bs=4M",
-                "conv=sparse,fsync",
-            ],
-            capture=not verbose,
-        )
+        fstype = layout["root_fstype"]
+        uuid = layout["root_uuid"]
+
+        if fstype.startswith("ext"):
+            run_cmd(["mkfs.ext4", "-q", "-F", "-m", "1", "-U", uuid, p_root], capture=not verbose)
+        elif fstype == "ntfs":
+            run_cmd(["mkfs.ntfs", "-Q", "-F", p_root], capture=not verbose)
+        elif fstype == "vfat" or fstype == "fat32":
+            run_cmd(["mkfs.vfat", p_root], capture=not verbose)
+        elif fstype == "exfat":
+            run_cmd(["mkfs.exfat", p_root], capture=not verbose)
+        else:  # Default to ext4 if unknown
+            run_cmd(
+                [
+                    "mkfs.ext4",
+                    "-q",
+                    "-F",
+                    "-T",
+                    "largefile",
+                    "-m",
+                    "0",
+                    "-e",
+                    "continue",
+                    p_root,
+                ],
+                capture=not verbose,
+            )
+
+        if p_boot and layout["boot_dev"]:
+            if verbose:
+                print(f"[{target}] Streaming boot partition to {p_boot}...")
+            run_cmd(
+                [
+                    "dd",
+                    f"if={layout['boot_dev']}",
+                    f"of={p_boot}",
+                    "bs=4M",
+                    "conv=sparse,fsync",
+                ],
+                capture=not verbose,
+            )
 
         # 4. Sync Files via Rsync/Fpsync
         if verbose:
             print(f"[{target}] Syncing files from shared source...")
         os.makedirs(dst_mnt, exist_ok=True)
         try:
-            run_cmd(["mount", p2, dst_mnt], capture=not verbose)
+            # Mount with appropriate options if needed
+            run_cmd(["mount", p_root, dst_mnt], capture=not verbose)
 
             if args.fpsync:
                 cmd = [
@@ -180,14 +275,24 @@ def clone_target(args, layout, src_mnt, target):
                     r"-lptgoDHAX --numeric-ids --inplace --filter=-x\ security.selinux",
                 ]
             else:
-                cmd = [
-                    "rsync",
-                    "-aHAX",
-                    "--numeric-ids",
-                    "--inplace",
-                    "--filter=-x security.selinux",
-                    "--one-file-system",
-                ]
+                if layout["root_fstype"].startswith("ext"):
+                    cmd = [
+                        "rsync",
+                        "-aHAX",
+                        "--numeric-ids",
+                        "--inplace",
+                        "--filter=-x security.selinux",
+                        "--one-file-system",
+                    ]
+                else:
+                    # Simpler flags for FAT/NTFS/exFAT to avoid permission errors
+                    cmd = [
+                        "rsync",
+                        "-rtv",
+                        "--inplace",
+                        "--one-file-system",
+                    ]
+
             run_cmd(cmd + [f"{src_mnt}/", f"{dst_mnt}/"], capture=not verbose)
         finally:
             subprocess.run(
@@ -252,7 +357,9 @@ def main():
                 break
             current = set(run_cmd(["lsblk", "-dn", "-o", "NAME"], capture=True).split())
             for dev in current - baseline:
-                if dev not in targets and dev != layout["source_disk"].replace("/dev/", ""):
+                if dev not in targets and dev != layout["source_disk"].replace(
+                    "/dev/", ""
+                ):
                     try:
                         # Filter out empty slots (e.g., multi-card readers without media)
                         size = int(
@@ -275,7 +382,9 @@ def main():
         if args.dry_run:
             print("\nDry run results:")
             for t in targets:
-                size = int(run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True))
+                size = int(
+                    run_cmd(["blockdev", "--getsize64", f"/dev/{t}"], capture=True)
+                )
                 status = "OK" if size >= layout["required_total_bytes"] else "TOO SMALL"
                 print(f"  /dev/{t}: {status} ({size / 1e9:.2f} GB)")
             return

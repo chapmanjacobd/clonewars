@@ -22,5 +22,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y parted rsync fdisk e2fsprogs util-linux coreutils dosfstools
 
-      - name: Run Cloning Tests
-        run: sudo ./tests/test_cloning.sh
+      - name: Run DD Pi Test
+        run: sudo ./tests/test_dd_pi.sh
+
+      - name: Run Rsync Pi Test
+        run: sudo ./tests/test_rsync_pi.sh
+
+      - name: Run DD Android Test
+        run: sudo ./tests/test_dd_android.sh
+
+      - name: Run Rsync Android Test
+        run: sudo ./tests/test_rsync_android.sh

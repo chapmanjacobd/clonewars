@@ -176,16 +176,18 @@ def clone_target(args, layout, src_mnt, target):
         run_cmd(["wipefs", "-a", disk], capture=not verbose)
 
         # 2. Rebuild Partition Table
+        # Use relative partition numbers (1, 2) instead of full paths (e.g., /dev/loop11)
+        # to avoid naming issues with loop/nvme devices.
         if layout["is_single_partition"]:
             sfdisk_input = (
                 f"label: dos\nlabel-id: {layout['disk_id']}\nunit: sectors\n"
-                f"{disk}1 : start={layout['root_start']}, type=83\n"
+                f"1 : start={layout['root_start']}, type=83\n"
             )
         else:
             sfdisk_input = (
                 f"label: dos\nlabel-id: {layout['disk_id']}\nunit: sectors\n"
-                f"{disk}1 : start={layout['boot_start']}, size={layout['boot_size_sectors']}, type=c\n"
-                f"{disk}2 : start={layout['root_start']}, type=83\n"
+                f"1 : start={layout['boot_start']}, size={layout['boot_size_sectors']}, type=c\n"
+                f"2 : start={layout['root_start']}, type=83\n"
             )
 
         subprocess.run(

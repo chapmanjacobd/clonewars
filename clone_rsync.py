@@ -299,11 +299,14 @@ def clone_target(args, layout, src_mnt, target):
         finally:
             subprocess.run(
                 ["umount", "-l", dst_mnt],
+                stdout=subprocess.DEVNULL if not verbose else None,
                 stderr=subprocess.DEVNULL,
-                capture_output=not verbose,
             )
             if os.path.exists(dst_mnt):
-                os.rmdir(dst_mnt)
+                try:
+                    os.rmdir(dst_mnt)
+                except Exception:
+                    pass
 
         run_cmd(["blockdev", "--flushbufs", disk], capture=not verbose)
         if verbose:

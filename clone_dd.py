@@ -187,7 +187,8 @@ def clone_target(args, layout, cutoff_byte, target):
         subprocess.run(
             f"mount | grep '^{dest_disk}' | cut -d' ' -f1 | xargs -r umount",
             shell=True,
-            capture_output=not verbose,
+            stdout=subprocess.DEVNULL if not verbose else None,
+            stderr=subprocess.DEVNULL,
         )
 
         # 2. Copy using DD

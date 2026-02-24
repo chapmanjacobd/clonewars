@@ -8,14 +8,22 @@ echo -e "${GREEN}Test: clone_dd.py with Pi Layout (FAT32+EXT4)${NC}"
 cd "$(dirname "$0")/.."
 
 cleanup() {
+    echo "Cleaning up..."
+    sync
     if mountpoint -q mnt_src; then sudo umount -l mnt_src || true; fi
     if mountpoint -q mnt_tgt; then sudo umount -l mnt_tgt || true; fi
+    
+    # Detach all loop devices associated with our test images
     for img in source_pi.img target_pi.img; do
         if [ -f "$img" ]; then
             LOOP_DEVS=$(sudo losetup -j "$img" | cut -d: -f1)
-            for dev in $LOOP_DEVS; do sudo losetup -d "$dev" || true; done
+            for dev in $LOOP_DEVS; do
+                sudo partprobe "$dev" || true
+                sudo losetup -d "$dev" || true
+            done
         fi
     done
+    sudo udevadm settle
     sudo rm -rf .tmp mnt_src mnt_tgt source_pi.img target_pi.img
 }
 trap cleanup EXIT
